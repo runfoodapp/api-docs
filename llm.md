@@ -13,7 +13,7 @@ Antes de pedir credenciales de producción, prueba todo contra nuestro **ambient
 
 **URL base:**
 ```
-https://ec-s2.runfoodapp.com/apps/public.demo/api/v1
+https://ec-s2.runfoodapp.com/apps/demo/api/v1
 ```
 
 **API Key (compartida, solo para pruebas):**
@@ -38,11 +38,11 @@ Verifica que estás conectado y que tu key funciona:
 
 ```bash
 # 1. Health check (no necesita auth)
-curl https://ec-s2.runfoodapp.com/apps/public.demo/api/v1/health
+curl https://ec-s2.runfoodapp.com/apps/demo/api/v1/health
 
 # 2. Tu identidad como app (requiere X-Api-Key)
 curl -H "X-Api-Key: 184bc6459fe440e1318852fb074f1d7f3c5036a049d5245beea810e13227a503" \
-     https://ec-s2.runfoodapp.com/apps/public.demo/api/v1/apps/me
+     https://ec-s2.runfoodapp.com/apps/demo/api/v1/apps/me
 ```
 
 Si los dos responden 200, ya estás listo para explorar los demás endpoints.
