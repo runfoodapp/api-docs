@@ -1,0 +1,467 @@
+<SYSTEM>This is the abridged developer documentation for RunFood API</SYSTEM>
+
+# API de RunFood
+
+> Conecta tu aplicación con RunFood, el punto de venta de restaurantes en Ecuador. Crea pedidos, factura ante el SRI, lee el catálogo y recibe eventos en tiempo real.
+
+## Antes de escribir código, dos cosas [Sección titulada «Antes de escribir código, dos cosas»](#antes-de-escribir-código-dos-cosas) **El servidor vive dentro del restaurante**, no en la nube. Cada local tiene el suyo, con su propia URL, su propio catálogo y su propia tasa de impuesto. Y **se cae** — se va la luz, reinician el router. Tu integración tiene que dar eso por hecho. **Cada cuenta produce una factura**, y esa factura la emite y la autoriza RunFood ante el SRI. Tú no construyes un firmador electrónico. Empieza en 5 minutos Un servidor de demo público, una API key y tu primer pedido. Sin pedir permiso. [Empezar →](/api-docs/guias/empezar/) Glosario SRI, RUC, RIDE, consumidor final, cuenta vs mesa. Si no eres de Ecuador, empieza aquí. [Ver glosario →](/api-docs/guias/glosario/) Ciclo del pedido Pedido abierto, venta directa o facturar después. Los tres caminos, con ejemplos. [Ver el flujo →](/api-docs/guias/order-lifecycle/) Totales e impuestos `total` es obligatorio y se valida al centavo. Aquí está cómo se calcula. [Cómo se calcula →](/api-docs/guias/totales-e-impuestos/) Webhooks Eventos en tiempo real, firmados con HMAC. Ojo: **no hay reintentos**. [Cómo funcionan →](/api-docs/guias/webhooks/) Referencia Los 30 endpoints, con ejemplos en cURL, PowerShell, Python, PHP, JavaScript, C#, Java y Go. [Ver referencia →](/api-docs/referencia/) Para IAs / agentes Documentación consumible por LLMs. [llms.txt](/api-docs/llms.txt) · [llms-full.txt](/api-docs/llms-full.txt)
+
+# Sistema contable
+
+> Integra un sistema contable con RunFood: recibe cada factura por webhook, descarga el XML autorizado por el SRI y reconcilia.
+
+Quieres que las ventas del restaurante lleguen solas a tu sistema contable, sin que nadie las transcriba a mano. Es el caso de integración más común y el más simple: **tú no creas nada en RunFood — solo escuchas.** ## Quién hace qué [Sección titulada «Quién hace qué»](#quién-hace-qué) ## El flujo [Sección titulada «El flujo»](#el-flujo) 
+```
+sequenceDiagram
+    participant POS as RunFood (en el local)
+    participant SRI
+    participant Tu as Tu sistema contable
+
+    POS->>POS: El cajero cobra y factura
+    POS-->>Tu: webhook INVOICE.CREATED
+    Note over Tu: Registras el asiento.<br/>El SRI aun no autoriza.
+    POS->>SRI: Envia el comprobante
+    SRI-->>POS: Autorizado
+    POS-->>Tu: webhook INVOICE.UPDATED
+    Tu->>POS: GET /invoices/{id}/xml
+    Note over Tu: Guardas el XML autorizado.
+```
+ `INVOICE.CREATED` llega ANTES de que el SRI autorice Si pides el XML en ese momento, recibes `409 xml_not_available`. **No es un error tuyo**: el comprobante todavía no existe como documento autorizado. Espera al `INVOICE.UPDATED`. ## Puesta en marcha [Sección titulada «Puesta en marcha»](#puesta-en-marcha) ### 1. Suscríbete a los eventos [Sección titulada «1. Suscríbete a los eventos»](#1-suscríbete-a-los-eventos) 
+```bash
+curl -X POST -H "X-Api-Key: $KEY" -H "Content-Type: application/json" \
+     "$BASE/webhooks" \
+     -d '{ "event": "INVOICE.CREATED", "endpoint": "https://tu-contable.com/hooks/runfood" }'
+```
+ 
+```json
+{ "id": 15, "eventName": "INVOICE.CREATED", "endpoint": "...", "secret": "rfwhk_9f3a...e21c" }
+```
+ **Guarda el `secret`**: solo se muestra aquí y es lo que te permite verificar la firma. Repite para `INVOICE.UPDATED` e `INVOICE.REVERSED`. Necesitas el scope `webhooks:write`. ### 2. Verifica la firma de cada entrega [Sección titulada «2. Verifica la firma de cada entrega»](#2-verifica-la-firma-de-cada-entrega) Antes de procesar nada. Está en la [guía de Webhooks](/api-docs/guias/webhooks/). ### 3. Descarga el comprobante autorizado [Sección titulada «3. Descarga el comprobante autorizado»](#3-descarga-el-comprobante-autorizado) 
+```bash
+curl -H "X-Api-Key: $KEY" "$BASE/invoices/8801/xml"   # XML autorizado por el SRI
+curl -H "X-Api-Key: $KEY" "$BASE/invoices/8801/pdf"   # RIDE (la representación en PDF)
+```
+ Necesitas `invoices:read`. ## Anulaciones [Sección titulada «Anulaciones»](#anulaciones) Si el local anula una factura, **te llega `INVOICE.REVERSED`** — con quién la anuló y por qué. Suscríbete: una venta anulada que sigue en tu contabilidad es un descuadre. ## Reconciliación: el paso que casi todos olvidan [Sección titulada «Reconciliación: el paso que casi todos olvidan»](#reconciliación-el-paso-que-casi-todos-olvidan) El servidor de RunFood vive **dentro del restaurante**. Se va la luz, se cae el internet, reinician el router. Y **los webhooks no se reintentan**: si tu servidor estaba caído, ese evento se perdió. Por eso los webhooks **no bastan**. Necesitas un proceso periódico que rellene los huecos: 
+```bash
+# Facturas del local en un rango de fechas
+curl -H "X-Api-Key: $KEY" \
+     "$BASE/invoices?from=2026-07-01&until=2026-07-11&page=1&limit=100"
+```
+ Compara con lo que tienes indexado y baja lo que falte. Una vez al día basta. `from`/`until` aceptan tres formas, y las tres valen igual: | Lo que mandas | Cómo se interpreta | | -------------------------------------------------------- | ------------------------------------------------------------------------------------------ | | `2026-07-01` | El día completo, en hora del local (`from` desde las 00:00:00, `until` hasta las 23:59:59) | | `2026-07-01T16:54` · `2026-07-01 16:54` | Esa hora, en hora del local | | `2026-07-01T16:54:00-05:00` · `2026-07-01T21:54:00.000Z` | Ese instante exacto, en la zona que declares | Las fechas que **devuelve** la API —`created_at`, `issue_date`, `statusChangedAt`— son siempre instantes ISO 8601: en UTC (`2026-07-01T21:54:00.000Z`) las que salen de la base, y con el offset que puso el SRI (`2026-07-01T16:54:00-05:00`) en `statusChangedAt`. Las dos formas son el mismo tipo de dato y las dos se pueden reenviar como `from`, así que puedes usar el `created_at` de la última factura que indexaste como el `from` de la próxima corrida y no se te escapa ni se te repite nada. ## Qué scopes pedir [Sección titulada «Qué scopes pedir»](#qué-scopes-pedir) | Scope | Para qué | | ---------------- | -------------------------------------------------------- | | `webhooks:write` | Registrar tus suscripciones (ya incluye `webhooks:read`) | | `invoices:read` | Descargar facturas, su XML y su RIDE, y reconciliar | **No pidas `orders:write` ni `invoices:write`.** Tú no creas pedidos ni emites facturas: solo lees. Pide el mínimo. ## Checklist antes de producción [Sección titulada «Checklist antes de producción»](#checklist-antes-de-producción) * [ ] Verifico la firma `X-Signature-256` de cada webhook, sobre el **cuerpo crudo** * [ ] Respondo `2xx` rápido y proceso en segundo plano * [ ] Deduplico por `X-Request-ID` * [ ] No asumo orden de llegada: ordeno por `timestamp` * [ ] Espero a `INVOICE.UPDATED` antes de pedir el XML * [ ] Estoy suscrito a `INVOICE.REVERSED` y proceso las anulaciones * [ ] Tengo **reconciliación diaria** con `GET /invoices?from=&until=` * [ ] Guardé el `secret` de cada suscripción (no se puede volver a leer)
+
+# Autenticación y scopes
+
+> Como autenticar contra la API de RunFood con el header X-Api-Key y que scope necesita cada endpoint.
+
+Todas las rutas (salvo las públicas) piden un solo header: 
+```plaintext
+X-Api-Key: <tu_api_key>
+```
+ No hay OAuth, ni tokens que caduquen, ni refresh. Una clave, un header. ## Rutas públicas (sin API key) [Sección titulada «Rutas públicas (sin API key)»](#rutas-públicas-sin-api-key) | Ruta | Por qué es pública | | --------------- | ---------------------------------------------------------------- | | `GET /health` | Para comprobar si el local está en línea sin gastar credenciales | | `GET /identity` | Para saber a qué RUC/local estás apuntando antes de autenticar | ## Los scopes [Sección titulada «Los scopes»](#los-scopes) Cada ruta exige un permiso. Pide **solo los que vayas a usar**: | Scope | Da acceso a | | ---------------------- | ------------------------------------------- | | `orders:read` | Consultar pedidos | | `orders:write` | Crear pedidos, editar sus ítems, anularlos | | `invoices:read` | Consultar facturas, su XML y su RIDE | | `invoices:write` | **Facturar** | | `products:read` | Consultar el catálogo | | `payment-methods:read` | Consultar los métodos de pago | | `webhooks:read` | Listar tus suscripciones | | `webhooks:write` | Crear y borrar suscripciones | | `apps:read` | Consultar tu propio perfil (`GET /apps/me`) | Llamar sin el permiso correspondiente devuelve `403 insufficient_scope`. Consulta los tuyos en `GET /apps/me`. ### `write` incluye `read` [Sección titulada «write incluye read»](#write-incluye-read) No hace falta pedir los dos. `orders:write` ya te deja leer pedidos; `invoices:write`, leer facturas. **Con una excepción, y es a propósito:** `orders:write` **no** incluye `invoices:write`. Facturar emite un comprobante ante el SRI a nombre del local — ese permiso se concede aparte, siempre. Una clave sin scopes es una llave maestra Una API key que se genere **sin scopes asignados** tiene **todos los permisos**. Al solicitar la tuya, **pide scopes explícitos** — y solo los que vayas a usar. ## Qué ves: todo el local, no solo lo tuyo [Sección titulada «Qué ves: todo el local, no solo lo tuyo»](#qué-ves-todo-el-local-no-solo-lo-tuyo) **Los pedidos y las facturas son del comercio, no de la app que los creó.** Con el scope correspondiente ves y operas sobre **todos los del local** — incluidos los que abrió el POS y los que creó otra app. Esto es lo que te habilita: * Facturar una **mesa abierta en el POS**. * Que **otra app cree el pedido y tú lo factures** (o al revés). Cada registro trae `external_app`, que dice **quién lo creó**. Es solo atribución: no limita lo que puedes hacer. En `GET /invoices`, filtra con `?created_by=me` si solo te interesan los tuyos. Pide solo los permisos que necesites `orders:read` te deja leer **todos** los pedidos del local, no un rincón privado tuyo. Es el dueño del local quien autoriza esos permisos al generar tu credencial — pide solo los que vayas a usar. ## Qué NO ves: los webhooks de otras apps [Sección titulada «Qué NO ves: los webhooks de otras apps»](#qué-no-ves-los-webhooks-de-otras-apps) Tus suscripciones a webhooks **sí son privadas**. Ninguna otra app puede verlas, modificarlas ni borrarlas — y tú tampoco las suyas. La diferencia es que una suscripción **no es un dato del local**: es configuración tuya (tu URL, tu secret). Que otra app pudiera borrarla solo serviría para tumbarte la integración en silencio. ## Un recurso que no existe da `404` [Sección titulada «Un recurso que no existe da 404»](#un-recurso-que-no-existe-da-404) Si pides algo que no existe, la respuesta es **`404 not_found`** — nunca un `403`. Un `403` confirmaría que el recurso existe, y eso ya es información. Y da `404` **mandes lo que mandes en el body**: el recurso se resuelve antes de validarlo. Un `400` siempre significa que el recurso existe y lo que está mal es tu petición.
+
+# Conectar un cliente real
+
+> Como dejar accesible el servidor de un local real desde internet: IP publica con HTTPS o tunel gestionado por RunFood.
+
+Ya probaste contra la demo. Ahora tienes un restaurante de verdad que quiere usar tu app. ## Lo que cambia respecto a la demo [Sección titulada «Lo que cambia respecto a la demo»](#lo-que-cambia-respecto-a-la-demo) | | Demo | Cliente real | | ------------------ | ----------------------- | ---------------------------------------------------- | | **URL base** | Fija y pública | **Distinta para cada local** | | **API key** | Compartida | Una tuya, para ese local | | **Datos** | De juguete, compartidos | Reales. Las facturas van al SRI. | | **Disponibilidad** | Casi siempre arriba | **Se cae.** Es un servidor dentro de un restaurante. | Cada local tiene su propia URL base RunFood es **on-premise**: cada restaurante corre **su propio servidor**, con su propia base de datos y su propio catálogo. **No existe una URL central** a la que apuntar con un `client_id`. La URL base de cada local **te la entregamos junto con la API key**. Tiene esta forma: 
+```plaintext
+https://<host-del-local>/api/v1
+```
+ Si integras 50 restaurantes, guardas **50 pares** de (URL base, API key). Diséñalo así desde el primer día: meterle multi-tenancy después a un cliente HTTP con la URL escrita a mano es doloroso. ## Cómo se pide el acceso [Sección titulada «Cómo se pide el acceso»](#cómo-se-pide-el-acceso) El dueño del local tiene que autorizarlo. El trámite —a quién escribir, qué datos mandar y qué cuesta— está en **[Pasar a producción](/api-docs/guias/produccion/)**. ## Los primeros cuatro pasos, en orden [Sección titulada «Los primeros cuatro pasos, en orden»](#los-primeros-cuatro-pasos-en-orden) Cuando ya tengas la URL base y la clave: ### 1. Comprueba que el local responde [Sección titulada «1. Comprueba que el local responde»](#1-comprueba-que-el-local-responde) 
+```bash
+curl https://<host-del-local>/api/v1/health
+```
+ No necesita API key. Si falla, el local está caído — y eso **no es una excepción**, es parte del día a día ([por qué](/api-docs/guias/on-premise/)). ### 2. Averigua con quién estás hablando [Sección titulada «2. Averigua con quién estás hablando»](#2-averigua-con-quién-estás-hablando) 
+```bash
+curl -H "X-Api-Key: $KEY" https://<host-del-local>/api/v1/identity
+```
+ 
+```json
+{
+  "ruc": "0992877878001",
+  "razonSocial": "Chili Dogo",
+  "nombreComercial": "LA PRIMAVERA",
+  "currency": "USD",
+  "taxes": { "vat_rate": 15 }
+}
+```
+ * **Guarda el `ruc`**: es cómo sabes de qué local es cada dato en tu sistema. * **Guarda `taxes.vat_rate`**: lo necesitas para calcular totales y **es distinto en cada local** ([Totales e impuestos](/api-docs/guias/totales-e-impuestos/)). ### 3. Sincroniza el catálogo [Sección titulada «3. Sincroniza el catálogo»](#3-sincroniza-el-catálogo) 
+```bash
+curl -H "X-Api-Key: $KEY" "https://<host-del-local>/api/v1/products?page=1&limit=100"
+curl -H "X-Api-Key: $KEY" "https://<host-del-local>/api/v1/payment-methods"
+```
+ Los `sku` y los `payment_method_id` **son de ese local**. No los compartas entre clientes: el `sku` de la Coca Cola en un restaurante no es el mismo que en otro. Vuelve a sincronizar cada cierto tiempo — el local cambia precios y da de alta productos. ### 4. Suscríbete a los eventos [Sección titulada «4. Suscríbete a los eventos»](#4-suscríbete-a-los-eventos) 
+```bash
+curl -X POST -H "X-Api-Key: $KEY" -H "Content-Type: application/json" \
+     "https://<host-del-local>/api/v1/webhooks" \
+     -d '{ "event": "INVOICE.CREATED", "endpoint": "https://tu-servidor.com/hooks/runfood/cliente-42" }'
+```
+ Guarda el `secret` que te devuelve: solo se muestra una vez. ## Si integras muchos locales [Sección titulada «Si integras muchos locales»](#si-integras-muchos-locales) El webhook no te dice de qué local viene Si apuntas todos tus clientes al **mismo** endpoint, no vas a poder distinguirlos por el cuerpo del mensaje. **Usa un endpoint distinto por local** — `https://tu-servidor.com/hooks/runfood/cliente-42`. Es lo más simple y no depende de nada del payload. ## Checklist [Sección titulada «Checklist»](#checklist) * [ ] Guardo **una URL base y una API key por local** * [ ] Guardo el `ruc` de cada local (`GET /identity`) * [ ] Guardo la **tasa de IVA** de cada local — no la escribo en el código * [ ] Sincronizo `sku` y `payment_method_id` **por local**, sin mezclarlos * [ ] Uso **un endpoint de webhook por local** * [ ] Asumo que el local **se va a caer**: tengo cola de reintentos y reconciliación
+
+# Empieza en 5 minutos
+
+> Prueba la API de RunFood en 5 minutos contra el ambiente de demo publico: URL base, API key compartida y dos llamadas con curl.
+
+Antes de pedir credenciales de producción, prueba todo contra nuestro **ambiente público de demo**. No hace falta pedir permiso ni pagar nada — toma la API key de abajo y empieza. ## Ambiente de demo [Sección titulada «Ambiente de demo»](#ambiente-de-demo) **URL base:** 
+```plaintext
+https://ec-s2.runfoodapp.com/apps/demo/api/v1
+```
+ **API Key (compartida, solo para pruebas):** 
+```plaintext
+184bc6459fe440e1318852fb074f1d7f3c5036a049d5245beea810e13227a503
+```
+ Cuando autentiques con esta key y llames a `GET /apps/me`, vas a ver esta identidad: | Campo | Valor | | ---------- | -------------------------------------------------------------------- | | `id` | `fantastic_app` | | `name` | `Fantastic App` | | `icon_url` | `https://runfoodapp.com/fantastic_app.png` | | `scopes` | `orders:write`, `products:read`, `payment-methods:read`, `apps:read` | Qué NO puedes hacer en la demo La clave de demo **no tiene permiso de facturación** (`invoices:write`). Puedes crear pedidos, leer el catálogo y consultar métodos de pago — pero **no puedes emitir facturas**. Si lo intentas, recibes `403 insufficient_scope`. Es a propósito: una factura de demo seguiría siendo un comprobante emitido ante la autoridad tributaria. Para probar facturación necesitas credenciales de un local real ([Pasar a producción](/api-docs/guias/produccion/)). ## Prueba rápida con curl [Sección titulada «Prueba rápida con curl»](#prueba-rápida-con-curl) Verifica que estás conectado y que tu key funciona: 
+```bash
+# 1. Health check (no necesita auth)
+curl https://ec-s2.runfoodapp.com/apps/demo/api/v1/health
+
+
+# 2. Tu identidad como app (requiere X-Api-Key)
+curl -H "X-Api-Key: 184bc6459fe440e1318852fb074f1d7f3c5036a049d5245beea810e13227a503" \
+     https://ec-s2.runfoodapp.com/apps/demo/api/v1/apps/me
+```
+ Si los dos responden 200, tu clave funciona. ## Tu primer pedido [Sección titulada «Tu primer pedido»](#tu-primer-pedido) Un pedido no se inventa: sus productos tienen que existir **en el catálogo de ese restaurante**. Así que el orden es siempre el mismo — **primero mira el catálogo, después pide**. ### 1. Mira qué vende el local [Sección titulada «1. Mira qué vende el local»](#1-mira-qué-vende-el-local) 
+```bash
+curl -H "X-Api-Key: $KEY" \
+     "https://ec-s2.runfoodapp.com/apps/demo/api/v1/products?limit=5"
+```
+ 
+```json
+{
+  "data": [
+    { "sku": "l0gx3604k9ivrxh4ayi4q35sh14ptx1or", "name": "Coca Cola", "price": 1.8,  "vat_applicable": true },
+    { "sku": "l0gx3ppdzeamz0l89b23e59leqht1emi", "name": "Fanta",     "price": 1.75, "vat_applicable": false }
+  ]
+}
+```
+ Fíjate en el `sku`: es **el código de ese producto en ese local**, y aquí es una cadena opaca. En otro local podrían ser códigos legibles. **No asumas un formato y no te lo inventes** — cópialo de aquí. ### 2. Crea el pedido [Sección titulada «2. Crea el pedido»](#2-crea-el-pedido) 
+```bash
+curl -X POST -H "X-Api-Key: $KEY" -H "Content-Type: application/json" \
+     "https://ec-s2.runfoodapp.com/apps/demo/api/v1/orders" \
+     -d '{
+       "external_id": "mi-pedido-001",
+       "status": "open",
+       "tabs": [
+         {
+           "external_id": "cuenta-1",
+           "name": "Mesa 5",
+           "items": [
+             { "sku": "l0gx3604k9ivrxh4ayi4q35sh14ptx1or", "quantity": 2, "unit_price": 1.80 }
+           ]
+         }
+       ]
+     }'
+```
+ Tres cosas que no son obvias y te van a hacer falta: * **`external_id` es tuyo.** Es el identificador del pedido **en tu sistema**. Si repites el mismo, RunFood responde `409` en vez de duplicar el pedido — eso es lo que te protege de cobrar dos veces cuando un reintento de red se cuela. * **`unit_price` es obligatorio.** Tú declaras a qué precio vendes; RunFood no lo toma del catálogo. * **Un pedido tiene `tabs` (cuentas).** Una cuenta es lo que se paga junto. Una mesa que “paga por separado” son varias cuentas dentro del mismo pedido. Cada cuenta produce **una** factura. ### 3. Léelo [Sección titulada «3. Léelo»](#3-léelo) 
+```bash
+curl -H "X-Api-Key: $KEY" \
+     "https://ec-s2.runfoodapp.com/apps/demo/api/v1/orders/1042"
+```
+ Ya está: el pedido existe en el POS del restaurante y salió por la impresora de cocina. ## Qué sigue [Sección titulada «Qué sigue»](#qué-sigue) * **[Ciclo de vida del pedido](/api-docs/guias/order-lifecycle/)** — cómo se cobra y se factura * **[Webhooks](/api-docs/guias/webhooks/)** — que RunFood te avise, en vez de preguntar tú * **[Pasar a producción](/api-docs/guias/produccion/)** — credenciales de un local real
+
+# Glosario
+
+> Que significa cada termino de la API de RunFood: pedido, cuenta, item, comprobante, forma de pago y app externa.
+
+RunFood nació en Ecuador y su API usa vocabulario fiscal ecuatoriano y de restaurantes. Si vienes de fuera, esta página te ahorra el rato de adivinar. ## El modelo [Sección titulada «El modelo»](#el-modelo) | Término | Qué es | | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | | **Local** / comercio / establecimiento | El restaurante. Es siempre **el mismo** concepto, aunque la palabra cambie. Cada local tiene su propio servidor RunFood, su RUC y su catálogo. | | **POS** | *Point of Sale*: la caja registradora del local. Es el propio RunFood, usado por el cajero. Un pedido puede nacer ahí o desde tu app. | | **Pedido** (`order`) | Lo que se consume. Contiene una o más cuentas. | | **Cuenta** (`tab`) | **Lo que se paga junto.** Es la unidad que se factura. Una mesa que “paga por separado” son varias cuentas dentro del mismo pedido. Cada cuenta produce exactamente **una** factura. | | **`sku`** | El código de un producto **en el catálogo de ese local**. No te lo inventas: lo sacas de `GET /products`. Puede ser legible (`PIZZA-M`) u opaco (`l0gx3604k9...`). | | **Comensal** | La persona que come. Ojo: en esta documentación, “cliente” a secas suele significar **el restaurante** (el cliente de RunFood), no el comensal. Los datos del comensal van en `billing`. | | **`pax`** | Número de comensales de una mesa. | ## Lo fiscal (Ecuador) [Sección titulada «Lo fiscal (Ecuador)»](#lo-fiscal-ecuador) | Término | Qué es | | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | | **SRI** | *Servicio de Rentas Internas*: la autoridad tributaria de Ecuador (el equivalente al SAT mexicano o la AEAT española). Toda factura electrónica tiene que ser **autorizada** por el SRI para ser válida. | | **Autorizar** | El SRI recibe el comprobante, lo valida y lo aprueba. **Tarda**: no es instantáneo. Hasta que ocurre, `GET /invoices/{id}/xml` y `/pdf` responden `409`. Quien lo envía y lo autoriza es **RunFood**, no tú. | | **RUC** | *Registro Único de Contribuyentes*: el identificador fiscal de una empresa o persona en Ecuador. Tiene **13 dígitos**. Es el equivalente al RFC/NIF/CUIT. | | **Consumidor final** | El comprador que **no da sus datos** (la mayoría de las ventas de un restaurante). Se factura con el RUC especial `9999999999999` (trece nueves) y el nombre “CONSUMIDOR FINAL”. **Lo declaras tú, explícito** en `billing` — RunFood nunca lo asume por omisión. | | **RIDE** | *Representación Impresa del Documento Electrónico*: el **PDF** legible de la factura, el que se le entrega al comensal. El documento con validez legal es el **XML**; el RIDE es su versión imprimible. | | **Comprobante** | Nombre genérico de un documento tributario electrónico: factura, nota de crédito, nota de entrega. | | **Nota de crédito** | Documento que **anula o corrige** una factura ya emitida. Una factura autorizada no se borra: se le emite una nota de crédito. | | **Nota de entrega** | Documento de entrega de mercadería **sin valor tributario de venta**. | | **Clave de acceso** | El código de 49 dígitos que identifica de forma única un comprobante ante el SRI. | | **Establecimiento / punto de emisión** | Los dos bloques de tres dígitos del número de factura (`001-001-000000123`). Identifican la sucursal y la caja que emitió. | | **IVA** | El impuesto al valor agregado. **Su tasa se configura por local y cambia con el tiempo** (Ecuador pasó de 12 % a 15 %). Léela siempre de `GET /identity` → ver [Totales e impuestos](/api-docs/guias/totales-e-impuestos/). | | **Base gravada / base 0** | El monto que paga IVA y el que no. Cada producto lo indica con `vat_applicable`. | ## Operación del local [Sección titulada «Operación del local»](#operación-del-local) | Término | Qué es | | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | | **Cierre de caja** | El corte diario: el local cuadra lo cobrado contra lo registrado y cierra el día. Es una operación interna del POS; no la controlas por API. | | **Bodega** | La sucursal o almacén. Un mismo negocio puede tener varias; cada servidor RunFood atiende a una. | | **Comanda** | El ticket que sale por la impresora de cocina cuando entra un pedido. | | **On-premise** | Que el servidor **está físicamente dentro del restaurante**, no en la nube. Tiene consecuencias directas para tu integración — ver [Consideraciones on-premise](/api-docs/guias/on-premise/). | ## Del API [Sección titulada «Del API»](#del-api) | Término | Qué es | | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | | **`external_id`** | **Tu** identificador, el que el recurso tiene **en tu sistema**. RunFood lo usa para la idempotencia: si repites uno, te devuelve `409` en vez de duplicar. Es único **por app** — otra app puede usar el mismo. | | **`reference`** | Un identificador **para humanos o periféricos**: el número de orden que ve el cliente en tu app, un código de seguimiento, el número de cliente, el código RFID de una pulsera. No es un ID de sistema — si tu registro ya tiene uno, ese va en `external_id`. RunFood no lo interpreta ni lo usa para buscar. | | **`id`** | El identificador **de RunFood**. Es el que se usa en las URLs (`/orders/1042`). | | **`external_app`** | Qué app creó un registro. Es **atribución**, no permiso: no limita lo que puedes ver. | | **Scope** | Un permiso (`orders:read`, `invoices:write`…). Tu API key lleva los suyos. `write` incluye `read`. | | **Idempotencia** | Que repetir una petición no duplique el efecto. Es lo que evita cobrar dos veces cuando un reintento de red se cuela. |
+
+# Límites y errores
+
+> Que rechaza la API de RunFood: codigos de error, limites de tamano, rate limiting y como responder a cada caso.
+
+Todo lo que el API rechaza, y por qué. Léelo antes de mandar tu integración a producción: casi todos estos límites se descubren en el peor momento. ## Forma de un error [Sección titulada «Forma de un error»](#forma-de-un-error) Todos los errores tienen la misma forma: 
+```json
+{
+  "error": "validation_error",
+  "message": "'tabs[0].items[2].quantity' must be > 0"
+}
+```
+ **Programa contra `error`, nunca contra `message`.** `error` es un código estable; `message` es texto legible y puede cambiar sin aviso. Además, **toda** respuesta lleva la cabecera `X-Request-Id`. Guárdala: es lo que permite encontrar tu petición exacta en los logs del servidor si reportas un fallo. ## Límites [Sección titulada «Límites»](#límites) | Límite | Valor | Si lo superas | | ------------------------------------------ | --------------------------------- | ----------------------- | | Tamaño del body | **1 MB** | `413 payload_too_large` | | Peticiones | **10/s sostenidas, ráfaga de 40** | `429 rate_limited` | | Cuentas por pedido | 50 | `400 validation_error` | | Ítems por cuenta | 500 | `400 validation_error` | | Modificadores por ítem | 20 | `400 validation_error` | | Pagos por factura | 20 | `400 validation_error` | | Operaciones por `PATCH /orders/{id}/items` | 500 | `400 validation_error` | | Llaves en `metadata` | 30 | `400 validation_error` | ### Rate limiting [Sección titulada «Rate limiting»](#rate-limiting) El cupo es **por app**, no por IP. Cada respuesta trae: | Header | Qué dice | | ----------------------- | ---------------------------------- | | `X-RateLimit-Limit` | Tu ráfaga máxima | | `X-RateLimit-Remaining` | Cuántas te quedan | | `Retry-After` | *(solo en 429)* Segundos a esperar | Es un *token bucket*: puedes gastar una ráfaga de golpe (sincronizar 40 pedidos seguidos es legítimo) y luego se rellena a 10/s. Respeta el `Retry-After` Reintentar de inmediato tras un `429` solo te vuelve a rebotar y te mantiene bloqueado. Espera los segundos que te indica, y usa backoff exponencial si insiste. ## Números: qué se acepta [Sección titulada «Números: qué se acepta»](#números-qué-se-acepta) | Campo | Regla | | ------------------- | ----------------------------------------------------------------- | | `quantity` | Mayor que 0. Máximo 100 000 | | `unit_price` | Mayor o **igual** que 0 (la cortesía es válida). Máximo 1 000 000 | | `payments[].amount` | Mayor que 0. Máximo 1 000 000 | | `total` | Mayor o igual que 0 | Nunca se aceptan negativos, `NaN` ni `Infinity`. Todo esto termina en una línea de factura del SRI: una cantidad negativa no es un caso de uso, es un bug. ## Texto: qué se acepta [Sección titulada «Texto: qué se acepta»](#texto-qué-se-acepta) Tus textos terminan en el **XML que se envía al SRI**. * ✅ **Emojis, acentos, ñ** — se aceptan. Son caracteres XML 1.0 perfectamente válidos. * ❌ **Caracteres de control** (y *surrogates* sueltos) — se rechazan con `400`. No son válidos en XML y corromperían el comprobante. Largos máximos: `external_id` y `reference` 64 · `name` 120 · `notes` 255 · `sku` 64 · `table_number` 20. ## Catálogo de errores [Sección titulada «Catálogo de errores»](#catálogo-de-errores) ### 400 — la petición no es válida [Sección titulada «400 — la petición no es válida»](#400--la-petición-no-es-válida) | `error` | Qué pasó | | ------------------------ | ---------------------------------------------------------------------------------------------------- | | `validation_error` | Campo faltante, fuera de rango, o con caracteres no admitidos | | `product_not_found` | Un `sku` que enviaste no existe en el catálogo del local | | `total_required` | Al facturar, `total` es obligatorio | | `payment_mismatch` | La suma de `payments` no cuadra con `total` | | `unknown_payment_method` | El método de pago no existe (mira `GET /payment-methods`) | | `billing_required` | Facturar exige `billing` — en las dos vías. El consumidor final se declara explícito, no por omisión | | `payments_required` | Facturar exige al menos un pago | | `payments_not_allowed` | Un pedido `open` no lleva pagos | | `invalid_state` | La operación no aplica al estado del pedido (ej. editar uno ya facturado) | ### 401 / 403 — quién eres y qué puedes [Sección titulada «401 / 403 — quién eres y qué puedes»](#401--403--quién-eres-y-qué-puedes) | `error` | Qué pasó | | -------------------- | ----------------------------------------------------------------------------- | | `missing_app_key` | Falta el header `X-Api-Key` | | `unknown_app` | La clave no corresponde a ninguna app | | `insufficient_scope` | Te falta el scope (¿es una venta directa? necesitas también `invoices:write`) | ### 404 — no existe [Sección titulada «404 — no existe»](#404--no-existe) | `error` | Qué pasó | | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | | `not_found` | El recurso no existe. En pedidos y facturas nunca significa “no es tuyo” — son del comercio, no de tu app (ver [Autenticación](/guias/autenticacion/)). En webhooks sí puede ser “existe pero no es tuyo”: son privados por app, y por privacidad no se distinguen de “no existe”. | | `tab_not_found` | Esa cuenta no está en ese pedido | ### 409 — choca con el estado actual [Sección titulada «409 — choca con el estado actual»](#409--choca-con-el-estado-actual) | `error` | Qué pasó | | -------------------- | ------------------------------------------------------------------------------------------------------------ | | `duplicate_order` | Ya existe un pedido con ese `external_id`. **Esto es la idempotencia funcionando** — no lo trates como fallo | | `nothing_to_invoice` | La cuenta ya estaba facturada | | `xml_not_available` | El SRI todavía no autoriza el comprobante | | `pdf_not_available` | El RIDE todavía no está listo | | `conflict` | Otro proceso está tocando ese pedido/mesa ahora mismo. Reintenta | ### 413 / 422 / 429 [Sección titulada «413 / 422 / 429»](#413--422--429) | `error` | Qué pasó | | ------------------- | ------------------------------------------------------------ | | `payload_too_large` | El body pasa de 1 MB | | `total_mismatch` | Tu `total` se aleja más de 1 centavo del que calcula RunFood | | `rate_limited` | Demasiadas peticiones. Espera el `Retry-After` | ### 500 — falló de nuestro lado [Sección titulada «500 — falló de nuestro lado»](#500--falló-de-nuestro-lado) `config_error`, `order_failed`, `invoice_failed`, `update_failed`, `internal_error`. No son culpa de tu petición. Reintenta con backoff; si persiste, repórtalo **con el `X-Request-Id`**. ## Qué reintentar y qué no [Sección titulada «Qué reintentar y qué no»](#qué-reintentar-y-qué-no) | Situación | ¿Reintentar? | | -------------------------------------------- | -------------------------------------------------------------------------------- | | `429`, `409 conflict`, `5xx`, timeout de red | **Sí**, con backoff exponencial | | `409 duplicate_order` | **No** — ya se creó. Es la respuesta correcta a tu reintento | | `4xx` de validación | **No.** Volver a mandar la misma petición dará el mismo error. Corrígela primero |
+
+# El servidor vive en el local
+
+> El servidor de RunFood vive dentro del local, no en la nube. Que implica eso para tu integracion y como prepararla.
+
+**RunFood es on-premise.** Esto es clave y tiene que entenderlo bien antes de escribir código: el servidor no vive en la nube, vive físicamente dentro del local del cliente. Está así a propósito — así la caja, el monitor de cocina y las impresoras funcionan a velocidad de red local aunque se vaya el internet. La consecuencia para ti como integrador es que **el servidor del cliente no siempre va a estar disponible**, y eso no es un error: es parte del día a día. Se va la luz, reinician el router, cambia la IP, el ISP del local tiene problemas. Tu integración tiene que asumir esto como un estado normal, no como una excepción. ## Cómo preparar tu integración [Sección titulada «Cómo preparar tu integración»](#cómo-preparar-tu-integración) Estas son las estrategias que recomendamos a los equipos que ya llevan tiempo integrados con RunFood. No son opcionales si quieres que tu producto sea estable en producción. ### 1. Cola de reintentos con backoff exponencial [Sección titulada «1. Cola de reintentos con backoff exponencial»](#1-cola-de-reintentos-con-backoff-exponencial) Cuando una request falla por timeout o devuelve 5xx, no la pierdas: guárdala en una cola local en tu lado y reinténtala con delays crecientes (por ejemplo 1s, 5s, 30s, 5min, 30min). Después de 24 horas sin éxito, escala el incidente y avisa al equipo que corresponde. ### 2. Idempotencia con `external_id` [Sección titulada «2. Idempotencia con external\_id»](#2-idempotencia-con-external_id) `POST /orders` acepta un campo `external_id` que debe ser único en tu sistema. Si reenvías un pedido con el mismo `external_id`, la API te devuelve `409` con el `id` del pedido que ya existía, en lugar de crear uno duplicado. **Úsalo siempre.** Es lo que evita que un reintento de red se convierta en un cobro duplicado — sin él, un reintento puede cobrarle dos veces al cliente final. ### 3. Webhooks en vez de polling [Sección titulada «3. Webhooks en vez de polling»](#3-webhooks-en-vez-de-polling) En lugar de preguntarle cada 10 segundos al servidor “¿pasó algo nuevo?”, suscríbete a los webhooks que te interesan (`ORDER.CREATED`, `ORDER.CLOSED`, `INVOICE.CREATED`, etc.). RunFood te empuja el cambio cuando ocurre. Esto reduce la carga en el servidor del cliente y tu latencia de reacción. El polling constante, en un ambiente on-premise con ancho de banda limitado, es una mala idea. ### 4. Valida la firma HMAC en cada webhook que recibas [Sección titulada «4. Valida la firma HMAC en cada webhook que recibas»](#4-valida-la-firma-hmac-en-cada-webhook-que-recibas) Cada webhook viene con un header `X-Signature-256`. Antes de procesar el payload, calcula `HMAC_SHA256(secret, raw_body)` y compáralo con lo que viene en ese header. Si no coinciden, descarta el mensaje. Esto protege tu endpoint aunque sea público: sin el secret, nadie puede falsificar un payload que tu servicio acepte. ### 5. Health check periódico [Sección titulada «5. Health check periódico»](#5-health-check-periódico) Llama a `GET /health` cada 1 a 5 minutos desde tu backend y guarda el resultado. Así armas un histórico de disponibilidad del cliente y detectas caídas antes que tus propios usuarios se quejen. ### 6. Reconcilia cuando el cliente vuelva a estar en línea [Sección titulada «6. Reconcilia cuando el cliente vuelva a estar en línea»](#6-reconcilia-cuando-el-cliente-vuelva-a-estar-en-línea) Después de una caída, no asumas que todo quedó sincronizado. Corre una pasada de reconciliación: * Los pedidos que tú tienes con `external_id` y que no aparecen en RunFood: reenvíalos. * Los pedidos que aparecen en RunFood y que tú no tienes indexados (porque perdiste webhooks durante la caída): bájalos y guárdalos. Esta rutina es la que hace la diferencia entre una integración que “más o menos funciona” y una que es confiable. ***
+
+# Ciclo de vida del pedido
+
+> El ciclo de vida de un pedido en RunFood: de abierto a facturado, con los estados que puede devolver la API.
+
+Un pedido en RunFood puede crearse **abierto** (pendiente, sin factura) o **cerrado** (facturado en el mismo momento). Y un pedido abierto se puede **facturar después**, cuenta por cuenta. Esta guía explica los tres caminos, qué estados verás y qué transiciones existen. ## El modelo: pedido → cuentas → facturas [Sección titulada «El modelo: pedido → cuentas → facturas»](#el-modelo-pedido--cuentas--facturas) Un **pedido** (`order`) contiene una o más **cuentas** (`tabs`). La cuenta es la unidad que se factura: Una mesa que “paga por separado” son varias cuentas dentro del mismo pedido. ## Estados que verás (`status`) [Sección titulada «Estados que verás (status)»](#estados-que-verás-status) | `status` | Significado | | ---------------------- | ------------------------------------------ | | `open` | Abierto: ninguna cuenta facturada | | `partially_closed` | Algunas cuentas facturadas, otras abiertas | | `closed` | Todas las cuentas facturadas | | `cancelled` | Anulado | | `scheduled` / `merged` | Estados internos del POS (los verás poco) | El `status` no lo envías tú: RunFood lo **calcula** a partir del estado de las cuentas. 
+```
+stateDiagram-v2
+    [*] --> open: POST /orders (status open)
+    [*] --> closed: POST /orders (status closed)
+
+    open --> partially_closed: factura 1 de N cuentas
+    open --> closed: factura la unica cuenta
+    partially_closed --> closed: factura la ultima cuenta
+    open --> cancelled: DELETE /orders/{id}
+
+    closed --> [*]
+    cancelled --> [*]
+
+    note right of open
+      PATCH /orders/{id}/items
+      (solo mientras esta abierto)
+    end note
+    note right of partially_closed
+      POST /orders/{id}/tabs/{tabId}/invoice
+      (una vez por cuenta)
+    end note
+```
+ ## Camino 1 — Pedido abierto (`status: "open"`) [Sección titulada «Camino 1 — Pedido abierto (status: "open")»](#camino-1--pedido-abierto-status-open) Crea el pedido **sin** facturarlo: la comanda va a cocina y se cobra más tarde. Las cuentas **no** llevan `payments`. 
+```json
+{
+  "external_id": "order-12345",
+  "status": "open",
+  "tabs": [
+    {
+      "external_id": "tab-1",
+      "name": "Mesa 5",
+      "items": [
+        { "sku": "PIZZA-M", "quantity": 2, "unit_price": 8.50 }
+      ]
+    }
+  ]
+}
+```
+ Dispara `ORDER.CREATED` y `ORDER.SAVED`. El `sku` es del catálogo del local, no tuyo No te lo inventas: es el código que ese producto tiene **en el catálogo del restaurante**, y lo obtienes de `GET /products`. **No asumas un formato.** En un local pueden ser códigos legibles (`PIZZA-M`) y en otro cadenas opacas (`l0gx3604k9ivrxh4ayi4q35sh14ptx1or`). Trátalo como una cadena cualquiera. Si envías un `sku` que ese local no tiene, recibes `400 product_not_found`. `unit_price` es obligatorio Tú declaras el precio con el que vendes — RunFood **no** lo toma del catálogo. Si lo omites, recibes `400 validation_error`. Se permite `0` (una cortesía es válida), nunca un negativo. ## Camino 2 — Venta directa (`status: "closed"`) [Sección titulada «Camino 2 — Venta directa (status: "closed")»](#camino-2--venta-directa-status-closed) Crea el pedido **y** lo factura en una sola llamada, de forma atómica. **Cada** cuenta necesita `billing`, `payments` y `total`. 
+```json
+{
+  "external_id": "order-12346",
+  "status": "closed",
+  "tabs": [
+    {
+      "external_id": "tab-1",
+      "name": "Mesa 5",
+      "billing": { "name": "CONSUMIDOR FINAL", "tax_id": "9999999999999", "tax_id_type": "ruc" },
+      "items":    [ { "sku": "PIZZA-M", "quantity": 2, "unit_price": 8.50 } ],
+      "total":    19.55,
+      "payments": [ { "payment_method_id": 1, "amount": 19.55 } ]
+    }
+  ]
+}
+```
+ De dónde sale el `19.55`: `2 × 8.50 = 17.00` de base, más el **IVA del 15 %** de ese local (`17.00 × 0.15 = 2.55`). La tasa de IVA NO es siempre 15 % Se configura **por local** y cambia con el tiempo. En un local al 12 %, ese mismo pedido da `19.04`, y mandar `19.55` te devuelve `422 total_mismatch`. Léela siempre de `GET /identity`. Está explicado en **[Totales e impuestos](/api-docs/guias/totales-e-impuestos/)** — no factures sin leer esa página. Dispara `ORDER.CREATED`, `ORDER.SAVED`, `ORDER.CLOSED` y un `INVOICE.CREATED` por cuenta. Necesitas DOS permisos Como esto emite una factura, exige **`orders:write` y además `invoices:write`**. Con solo `orders:write` recibes `403 insufficient_scope`. ## Camino 3 — Facturar después [Sección titulada «Camino 3 — Facturar después»](#camino-3--facturar-después) Un pedido que quedó `open` se factura **cuenta por cuenta**, cuando el cliente pide la cuenta. ### Primero: consigue el `tabId` [Sección titulada «Primero: consigue el tabId»](#primero-consigue-el-tabid) Para facturar una cuenta necesitas su **id de RunFood**, que **no es** el `external_id` que tú le pusiste. El `tabId` no viene al crear el pedido En la respuesta de `POST /orders`, el `id` de cada cuenta llega **`null`**. RunFood lo asigna, pero no lo devuelve ahí. **Vuelve a leer el pedido** para obtenerlo: 
+```bash
+GET /orders/1042
+```
+ 
+```json
+{
+  "id": 1042,
+  "status": "open",
+  "tabs": [
+    { "id": 7, "external_id": "tab-1", "name": "Mesa 5", "total": 19.55 }
+  ]
+}
+```
+ Ese `"id": 7` es tu `tabId`. Guárdalo o vuelve a pedirlo cuando vayas a cobrar. ### Después: factura la cuenta [Sección titulada «Después: factura la cuenta»](#después-factura-la-cuenta) 
+```plaintext
+POST /orders/1042/tabs/7/invoice
+```
+ 
+```json
+{
+  "billing":  { "name": "CONSUMIDOR FINAL", "tax_id": "9999999999999", "tax_id_type": "ruc" },
+  "total":    19.55,
+  "payments": [ { "payment_method_id": 1, "amount": 19.55 } ]
+}
+```
+ Factura esa cuenta **completa**. Si era la última cuenta abierta, el pedido pasa a `closed`; si quedan otras, pasa a `partially_closed`. Scope: `invoices:write`. ### Cómo se concilia el total [Sección titulada «Cómo se concilia el total»](#cómo-se-concilia-el-total) `total` es **obligatorio** y pasa por dos filtros independientes: 1. **Contra tus pagos.** `total` debe igualar la suma de `payments` exacto (± 0.01). Si no → `400 payment_mismatch`. 2. **Contra el cálculo de RunFood.** RunFood recalcula el total con su propio motor (IVA, redondeo del comercio). Si tu `total` se aleja más de 1 centavo → `422 total_mismatch`. Si ambos pasan, **la factura se emite con el total de RunFood**, no con el tuyo: es RunFood quien firma el comprobante ante el SRI y responde por él. Tu `total` actúa como *conciliador* — declara lo que cobraste para que RunFood confirme que ambos ven lo mismo. ## Consultar las facturas [Sección titulada «Consultar las facturas»](#consultar-las-facturas) | Método | Ruta | Scope | Qué hace | | ------ | ----------------------- | --------------- | ------------------------------------------------------------------------------------- | | `GET` | `/orders/{id}/invoices` | `invoices:read` | Facturas de ese pedido | | `GET` | `/invoices` | `invoices:read` | Facturas del local (`type`, `status`, `from`, `until`, `page`, `limit`, `created_by`) | | `GET` | `/invoices/{id}` | `invoices:read` | Detalle + ítems + pagos + estado ante el SRI | | `GET` | `/invoices/{id}/xml` | `invoices:read` | XML autorizado por el SRI | | `GET` | `/invoices/{id}/pdf` | `invoices:read` | RIDE (el PDF del comprobante) | El XML y el PDF **no existen hasta que el SRI autoriza** el comprobante. Mientras tanto recibes `409 xml_not_available` / `409 pdf_not_available` — no es un error tuyo, es que aún no está listo. Reintenta más tarde o espera el webhook `INVOICE.UPDATED`. ## Idempotencia: no cobres dos veces [Sección titulada «Idempotencia: no cobres dos veces»](#idempotencia-no-cobres-dos-veces) `external_id` (del pedido) y `tabs[].external_id` (de cada cuenta) deben ser únicos en tu sistema. Si reenvías el mismo `external_id`, el API responde **`409 duplicate_order`** con el id del pedido que ya existía, en vez de duplicarlo. Sin esto, un reintento tras un fallo de red puede **cobrar dos veces**. ## Qué puedes hacer con un pedido [Sección titulada «Qué puedes hacer con un pedido»](#qué-puedes-hacer-con-un-pedido) | Método | Ruta | Scope | Efecto | | -------- | ----------------------------------- | ----------------------------------------------- | ---------------------------------------------------------- | | `POST` | `/orders` | `orders:write` (+ `invoices:write` si `closed`) | Crear | | `GET` | `/orders/{id}` | `orders:read` | Consultar | | `PATCH` | `/orders/{id}/items` | `orders:write` | Agregar/quitar/actualizar ítems — solo si está **abierto** | | `POST` | `/orders/{id}/tabs/{tabId}/invoice` | `invoices:write` | Facturar una cuenta | | `DELETE` | `/orders/{id}` | `orders:write` | Anular — solo si está **abierto** | Un pedido ya facturado no se edita ni se anula por API: se anula desde el POS, porque eso implica una nota de crédito ante el SRI.
+
+# Pagos externos y fidelización
+
+> Integra tu tarjeta de consumo, monedero o programa de puntos con la caja de RunFood: iframe de identificacion, postMessage y confirmacion por webhook.
+
+RunFood puede delegar el cobro en **tu** sistema: tarjetas de consumo, monederos, programas de puntos. El cajero toca tu forma de pago, RunFood abre tu página dentro del POS, tú resuelves el cobro y devuelves el resultado. RunFood arma el pago con eso y factura. Este flujo es distinto del resto del API: aquí **RunFood llama a tu interfaz**, no al revés. ## Para qué sirve este flujo [Sección titulada «Para qué sirve este flujo»](#para-qué-sirve-este-flujo) Para **ver un saldo y usarlo**. El dinero ya existe en tu sistema —una tarjeta de consumo cargada, un monedero, puntos acumulados— y lo único que ocurre en el cobro es consultarlo y consumirlo. Si tu integración *ejecuta* la transacción, este no es el flujo Cobrar con tarjeta de crédito o débito, capturar una autorización contra un POS bancario, o cualquier caso donde **el dinero se mueve en el momento del cobro**, necesita garantías que este flujo no da: confirmación en línea, reversa y conciliación de la transacción. Ese flujo **todavía no existe**. Si tu integración ejecuta el cobro, escribe a **<desarrollo@runfoodapp.com>** antes de construir sobre esta guía. ## Quién hace qué [Sección titulada «Quién hace qué»](#quién-hace-qué) Tu página no factura, no calcula impuestos y no decide el total de la venta. Solo responde una pregunta: *cuánto se cobra por este medio, y con qué datos*. ## El flujo [Sección titulada «El flujo»](#el-flujo) 
+```
+sequenceDiagram
+    actor Cajero
+    participant POS as RunFood (en el local)
+    participant Tu as Tu pagina (iframe)
+    participant Srv as Tu servidor
+
+    Cajero->>POS: Toca tu forma de pago
+    Note over POS,Tu: ABRE el modal
+    POS->>Tu: Carga tu URL (sin parametros)
+    Cajero->>Tu: Ingresa el codigo del cliente
+    Tu->>Srv: Consulta saldo
+    Srv-->>Tu: Saldo disponible
+    Tu-->>POS: postMessage con monto y datos
+    Note over POS,Tu: CIERRA el modal
+    POS->>Cajero: Muestra tu resultado en el panel de cobro
+    Cajero->>POS: Cierra la venta
+    POS-->>Srv: webhook INVOICE.CREATED
+    Note over Srv: Recien aqui el cobro<br/>esta confirmado.
+```
+ Devolver el monto no confirma nada Que tu página devuelva un monto **no** significa que la venta se cerró. El cajero todavía puede cancelar, cambiar de forma de pago o cerrar el POS. **El cobro se confirma únicamente con el webhook `INVOICE.CREATED`.** Si tu sistema descuenta saldo al devolver el monto, necesitas poder revertirlo cuando ese webhook no llega. ## Puesta en marcha [Sección titulada «Puesta en marcha»](#puesta-en-marcha) ### 1. Registra tu forma de pago [Sección titulada «1. Registra tu forma de pago»](#1-registra-tu-forma-de-pago) La configuración vive en la forma de pago del local: | Campo | Qué es | | ----------------- | -------------------------------------------------------------------------- | | `urlConsulta` | La URL de tu página. **Absoluta y `https`** (ver [Seguridad](#seguridad)). | | `urlConsultaTipo` | `iframe` — tu página se abre dentro del POS. | Escribe a **<desarrollo@runfoodapp.com>** con la URL de tu página y el nombre con el que quieres que aparezca en la caja. No es algo que se configure por API. ### 2. Devuelve el cobro [Sección titulada «2. Devuelve el cobro»](#2-devuelve-el-cobro) Cuando el cobro está resuelto, tu página envía un mensaje al POS: 
+```js
+window.parent.postMessage({
+  pago: {
+    monto: 12.50,                    // obligatorio
+    montoMaximo: 50.00,              // opcional: tope disponible (ej. saldo de la tarjeta)
+    numeroTransaccion: 998877,       // opcional: tu numero de autorizacion
+    observacion: "Tarjeta 4821",
+    additional_info: { tarjetaConsumo: "TC-0042" }
+  },
+  cliente: { razonSocial: "MARIA PEREZ", cedula: "0912345678" },
+  venta_metadata: { additional_info: {} },
+  resultado_mostrar_html_plano: "<b>Saldo disponible</b><br/>$37.50 despues de este consumo"
+}, "*");
+```
+ | Campo | Obligatorio | Qué hace | | -------------------------------- | ----------- | -------------------------------------------------------------------------------------------------- | | `pago.monto` | **Sí** | El monto a cobrar. Si falta o no es un número ≥ 0, **el mensaje se descarta entero, en silencio**. | | `pago.montoMaximo` | No | Tope disponible por este medio. | | `pago.numeroTransaccion` | No | Tu número de autorización. Se guarda en la columna del pago. | | `pago.observacion` | No | Texto libre del pago. Se guarda. | | `pago.additional_info` | No | Ver [Qué se guarda](#qu%C3%A9-se-guarda-y-qu%C3%A9-no). | | `cliente` | No | Datos de facturación — ver abajo. | | `venta_metadata.additional_info` | No | Igual que `pago.additional_info`, a nivel venta. | | `resultado_mostrar_html_plano` | No | HTML de presentación — ver abajo. | **`cliente` son los datos de la factura.** Si tu sistema conoce al cliente (porque lo identificaste por su código o su tarjeta), envíalos y RunFood los usa para facturar. Se copian **solo en los campos que el cajero dejó vacíos**: lo que él ya escribió manda. Si no conoces al cliente, omite la propiedad — no la mandes vacía. **`resultado_mostrar_html_plano` es tu espacio de presentación en el POS.** Es un bloque de HTML que RunFood muestra en el panel de cobro, para que presentes tu información con formato: saldo restante, puntos acumulados, nombre del titular, lo que tenga sentido. No es un comprobante ni se guarda: es pantalla. Se sanitiza antes de mostrarse (se eliminan scripts y handlers de evento). ### 3. Confirma por webhook [Sección titulada «3. Confirma por webhook»](#3-confirma-por-webhook) Suscríbete a `INVOICE.CREATED` para saber que el cobro se consumó, y a `INVOICE.CANCELLED` para saber que se revirtió. Ver la [guía de webhooks](/api-docs/guias/webhooks/). Para cruzar el webhook con tu transacción, usa el `numeroTransaccion` que enviaste en el paso 2: viaja con el pago hasta la factura. ## Cómo diseñar la experiencia [Sección titulada «Cómo diseñar la experiencia»](#cómo-diseñar-la-experiencia) El cajero está frente a un cliente esperando. Cada pantalla que agregas la paga alguien haciendo fila. La regla es una sola: **tu iframe existe para pedir lo que RunFood no puede saber, y nada más.** ### El camino recomendado [Sección titulada «El camino recomendado»](#el-camino-recomendado) 1. **Identifica.** Tu página pide un código, un número de tarjeta o un documento. Eso es lo único que el cajero no puede resolver desde el POS. 2. **Devuelve y cierra.** Consultas tu sistema y devuelves el monto junto con `resultado_mostrar_html_plano`. El modal se cierra y **el saldo se presenta en la pantalla de cobro de RunFood**, donde el cajero ya está mirando. Dos pasos. El cajero escribe un código y sigue cobrando. El error más común: mostrar el saldo dos veces Un diseño que aparece solo: la página pide el código, **muestra el saldo dentro del iframe**, espera que el cajero presione “Aceptar”, y entonces RunFood vuelve a mostrar la misma información en el panel de cobro. Es un clic de más y la misma información dos veces. Como tienes `resultado_mostrar_html_plano`, **preséntala directamente en RunFood** y ahórrate esa pantalla. ### Cuándo sí agregar pasos en tu iframe [Sección titulada «Cuándo sí agregar pasos en tu iframe»](#cuándo-sí-agregar-pasos-en-tu-iframe) Solo si el cajero tiene que **hacer** algo más, no ver algo más. Por ejemplo: elegir entre varias tarjetas del mismo titular, decidir cuántos puntos aplicar, o confirmar una autorización que tu sistema exige. Si el paso no cambia el resultado del cobro, no es un paso: es una pantalla de lectura, y esa va en `resultado_mostrar_html_plano`. ### Usa las columnas para lo que son [Sección titulada «Usa las columnas para lo que son»](#usa-las-columnas-para-lo-que-son) Cada dato tiene su lugar. Meterlos todos en el mismo campo hace que después no se puedan buscar, reportar ni cuadrar: | Dato | Dónde va | | ----------------------------------------- | ------------------------------------------------------- | | Tu número de autorización | `numeroTransaccion` | | Una nota corta sobre el cobro | `observacion` | | El identificador de la tarjeta de consumo | `additional_info.tarjetaConsumo` | | Saldo, puntos, mensajes al cajero | `resultado_mostrar_html_plano` (pantalla, no se guarda) | ## Qué se guarda y qué no [Sección titulada «Qué se guarda y qué no»](#qué-se-guarda-y-qué-no) Del objeto `pago` solo se copian **cuatro** claves: `monto`, `montoMaximo`, `numeroTransaccion` y `observacion`. Cualquier otra se descarta. `additional_info` no es una bolsa libre No existe ninguna columna donde guardar `additional_info` completo. Solo se rescatan estas claves, que van a columnas dedicadas; **todo lo demás se pierde sin error**: | Clave | Dónde termina | | --------------------------------------------------------------------- | ------------------------------- | | `additional_info.tarjetaConsumo` | Tarjeta de consumo del pago | | `additional_info.idMarcaTarjeta` · `idBancoTarjeta` · `idTipoTarjeta` | Marca / banco / tipo de tarjeta | Si necesitas que un dato tuyo sobreviva a la venta, mándalo en `pago.observacion` (texto libre, se guarda) o guárdalo de tu lado y crúzalo por el webhook del paso 3. ## Cómo se aplica tu monto [Sección titulada «Cómo se aplica tu monto»](#cómo-se-aplica-tu-monto) * **`monto >= total` de la venta** → tu pago cubre todo y queda como pago único. * **`monto < total`** → se agrega como un pago más y el cajero completa el resto con otra forma de pago. En ambos casos el modal se cierra apenas llega tu mensaje. **No hay reintento ni tiempo de espera**: si tu página no envía nada, el cajero cierra el modal y no pasa nada. Si envías dos mensajes, el segundo llega con el modal ya cerrado y se ignora. ## Seguridad [Sección titulada «Seguridad»](#seguridad) El POS acepta tu mensaje solo si: 1. **El `origin` coincide** con el origin de la `urlConsulta` configurada, y 2. **el mensaje viene del `iframe` que abrió** (`event.source`). Por eso tu `urlConsulta` tiene que ser una **URL absoluta con `https`**. Una URL relativa o inválida deja sin efecto la primera validación. El HTML de `resultado_mostrar_html_plano` se sanitiza con una lista blanca antes de mostrarse. No lo uses como canal de datos: es presentación. ## Checklist antes de producción [Sección titulada «Checklist antes de producción»](#checklist-antes-de-producción) * [ ] Tu `urlConsulta` es absoluta, `https`, y responde rápido — el cajero espera frente al cliente. * [ ] Tu página pide identificación y **devuelve en un solo paso**; el saldo se presenta en RunFood. * [ ] Envías `pago.monto` siempre. Sin él, el mensaje se descarta sin aviso. * [ ] Envías `cliente` solo cuando conoces al cliente, y sabes que serán los datos de la factura. * [ ] Usas `numeroTransaccion` para tu autorización, no `observacion`. * [ ] Estás suscrito a `INVOICE.CREATED` y a `INVOICE.CANCELLED`. * [ ] Si descuentas saldo al devolver el monto, puedes revertirlo cuando el webhook no llega.
+
+# Pasar a producción
+
+> Como solicitar credenciales de API para un cliente real de RunFood: datos necesarios, plantillas de correo y costos.
+
+El demo sirve para desarrollar, pero cuando quieras conectarte con un cliente real necesitas credenciales nuevas, específicas para ese local. ## Antes de solicitar acceso [Sección titulada «Antes de solicitar acceso»](#antes-de-solicitar-acceso) El cliente (el restaurante o local que usa RunFood) tiene que ser alcanzable desde internet. Hay dos caminos: 1. **El cliente pone su propia infraestructura.** IP pública fija más un certificado HTTPS válido instalado en su servidor RunFood. Es lo ideal si ya tiene equipo técnico. 2. **Nosotros le damos un túnel gestionado.** Le asignamos un subdominio tipo `mi-restaurante.runfoodapp.com` y nos encargamos del HTTPS y de exponer el servicio. Útil cuando el cliente no quiere lidiar con redes. Además, necesitas tener claros los datos de tu app antes de enviar la solicitud: | Campo | Descripción | | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | | `id` | Identificador único (ej. `fantastic_app`). Debe ser único en todo RunFood: no se puede repetir en ningún otro cliente. Piénsalo como un handle global. | | `name` | Nombre que se va a mostrar al usuario dentro del POS (ej. *Fantastic App*). | | `icon_url` | URL pública de tu ícono. PNG cuadrado, mínimo 128x128. | | `scopes` | Los permisos que tu app necesita (lista separada por comas). Pide solo los que vas a usar. | ## Cómo solicitarla [Sección titulada «Cómo solicitarla»](#cómo-solicitarla) Todo se tramita por correo a **<desarrollo@runfoodapp.com>**. Lo más limpio es que el **dueño del local** sea quien envíe la solicitud desde su correo, porque así queda autorizada al instante. Si prefieres encargarte tú como integrador, puedes hacerlo — pero entonces el dueño tiene que mandarnos por separado una autorización corta desde su correo (abajo hay una plantilla para cada caso). El correo de solicitud debe incluir: * **Del cliente:** RUC, razón social, ciudad y sector * **Del servidor del cliente:** IP pública o URL del túnel, más el puerto * **De tu app:** los 4 campos de la tabla anterior (`id`, `name`, `icon_url`, `scopes`) ### Plantilla — solicitud enviada por el dueño del local [Sección titulada «Plantilla — solicitud enviada por el dueño del local»](#plantilla--solicitud-enviada-por-el-dueño-del-local) Copia este texto, reemplaza los `[corchetes]` y envíalo desde el correo del dueño: 
+```text
+Asunto: Solicitud de credenciales API — [RUC] — [Nombre de la app]
+
+
+Hola equipo de RunFood,
+
+
+Autorizo la creación de credenciales de API de terceros para mi
+establecimiento con los siguientes datos:
+
+
+DATOS DEL ESTABLECIMIENTO
+- Razón social: [Razón social]
+- RUC: [RUC]
+- Ciudad / sector: [Ciudad, sector]
+- IP pública o URL del túnel: [ej. 181.xxx.xxx.xxx:3200]
+
+
+APLICACIÓN A CONECTAR
+- Nombre visible: [Nombre de la app]
+- ID (identificador único): [identificador_app]
+- URL del ícono: https://...
+- Permisos solicitados: [ej. orders:read, orders:write, products:read]
+
+
+Confirmo haber leído los costos de activación vigentes y estoy de acuerdo.
+
+
+Saludos,
+[Nombre del dueño]
+[Correo]
+[Teléfono]
+```
+ ### Plantilla — autorización corta del dueño (cuando el integrador hace la solicitud) [Sección titulada «Plantilla — autorización corta del dueño (cuando el integrador hace la solicitud)»](#plantilla--autorización-corta-del-dueño-cuando-el-integrador-hace-la-solicitud) Si la solicitud técnica la envía el integrador, necesitamos que el **dueño** nos mande por separado este correo desde su cuenta. Sin él no podemos avanzar. 
+```text
+Asunto: Autorización de integración API — [RUC]
+
+
+Hola equipo de RunFood,
+
+
+Autorizo a [Nombre del integrador], correo [correo@integrador.com],
+a solicitar y gestionar credenciales de API de terceros en mi cuenta
+de RunFood.
+
+
+RUC: [RUC]
+Razón social: [Razón social]
+Ciudad / sector: [Ciudad, sector]
+
+
+Saludos,
+[Nombre del dueño]
+```
+ ## Costos [Sección titulada «Costos»](#costos) | Concepto | Costo | Modalidad | | ------------------------------------ | ---------------- | ------------------------------------------------------------------------ | | **Generación de API Key** | **USD 50** | Pago único, de por vida, por cada credencial que se genere en un cliente | | **Túnel gestionado — activación** | **USD 30** | Pago único al activar el subdominio | | **Túnel gestionado — mantenimiento** | **USD 10 / mes** | Recurrente, a partir del segundo mes | > El túnel es **opcional**. Si el cliente ya tiene su propia IP pública con HTTPS, no lo necesitas y no pagas nada por ese concepto. ***
+
+# Totales e impuestos
+
+> Como calcula RunFood el subtotal, el IVA y el total de un pedido, y como conciliar el total que declaras al facturar.
+
+Al facturar, `total` es **obligatorio** y RunFood lo compara con su propio cálculo. Si se aleja más de **un centavo**, rechaza la factura con `422 total_mismatch`. Así que necesitas saber exactamente cómo sale ese número. ## Las tres reglas [Sección titulada «Las tres reglas»](#las-tres-reglas) ### 1. `unit_price` va SIN impuesto [Sección titulada «1. unit\_price va SIN impuesto»](#1-unit_price-va-sin-impuesto) El precio que envías es la **base imponible**. RunFood le suma el impuesto encima. Si vendes una Coca Cola a $1,80 con IVA incluido, lo que mandas **no** es `1.80`. ### 2. El impuesto depende del producto [Sección titulada «2. El impuesto depende del producto»](#2-el-impuesto-depende-del-producto) Cada producto del catálogo trae `vat_applicable` (`GET /products`): 
+```json
+{ "sku": "l0gx3604...", "name": "Coca Cola", "price": 1.80, "vat_applicable": true  }
+{ "sku": "l0gx3ppd...", "name": "Fanta",     "price": 1.75, "vat_applicable": false }
+```
+ * `vat_applicable: true` → paga IVA * `vat_applicable: false` → no paga (base 0) ### 3. La tasa de IVA es **de cada local** [Sección titulada «3. La tasa de IVA es de cada local»](#3-la-tasa-de-iva-es-de-cada-local) No escribas la tasa en tu código El IVA **se configura por local y cambia con el tiempo**. Ecuador pasó del 12 % al 15 %, y hoy conviven locales con una y con otra. Léela de `GET /identity`: 
+```json
+{
+  "ruc": "0992877878001",
+  "razonSocial": "Chili Dogo",
+  "currency": "USD",
+  "taxes": { "vat_rate": 15 }
+}
+```
+ Si la fijas a mano, funcionará con un cliente y te dará `422 total_mismatch` con el siguiente. ## El cálculo, paso a paso [Sección titulada «El cálculo, paso a paso»](#el-cálculo-paso-a-paso) Un pedido de **2 Coca Colas a $1,80** en un local con IVA del **15 %**: | Paso | Cálculo | Resultado | | ------------------------- | -------------------- | ---------- | | Base imponible (paga IVA) | `2 × 1.80` | `3.60` | | Base 0 (no paga IVA) | — | `0.00` | | IVA | `3.60 × 15 / 100` | `0.54` | | **Total** | `3.60 + 0.00 + 0.54` | **`4.14`** | Ese `4.14` es el `total` que envías. En un local con IVA del **12 %**, el mismo pedido da **`4.03`**. Mismo carrito, distinto total. Por eso la tasa se lee, no se asume. En pseudocódigo: 
+```js
+const { taxes } = await get("/identity");        // { vat_rate: 15 }
+
+
+let baseGravada = 0, baseCero = 0;
+for (const item of items) {
+  const linea = item.quantity * item.unit_price;
+  if (producto[item.sku].vat_applicable) baseGravada += linea;
+  else                                   baseCero    += linea;
+}
+
+
+const iva   = round2(baseGravada * taxes.vat_rate / 100);
+const total = round2(baseGravada + baseCero + iva);
+```
+ ## Por qué te piden el total si RunFood ya lo calcula [Sección titulada «Por qué te piden el total si RunFood ya lo calcula»](#por-qué-te-piden-el-total-si-runfood-ya-lo-calcula) Porque **tú ya le cobraste al cliente**. RunFood no está preguntando cuánto es: está comprobando que ambos vieron lo mismo antes de emitir un comprobante ante la autoridad tributaria. Si tu `total` y el suyo no cuadran, algo va mal — tu catálogo está desactualizado, la tasa cambió, o enviaste otro precio. Mejor un `422` que una factura equivocada firmada a nombre del local. ## Los dos errores del total (no son lo mismo) [Sección titulada «Los dos errores del total (no son lo mismo)»](#los-dos-errores-del-total-no-son-lo-mismo) | Error | HTTP | Qué falló | | ------------------ | ----- | ----------------------------------------------------------------------------------------------------------------------------------------- | | `payment_mismatch` | `400` | Tu `total` no coincide con la suma de tus `payments`. **Es un error tuyo, contra ti mismo** — no cuadras con tus propios pagos. | | `total_mismatch` | `422` | Tu `total` sí cuadra con tus pagos, pero **no con el cálculo de RunFood**. Normalmente: tasa de IVA equivocada o precios desactualizados. | Si te sale `total_mismatch`, relee `GET /identity` y `GET /products` antes de tocar nada más. ## Descuentos [Sección titulada «Descuentos»](#descuentos) El descuento se declara aparte, **nunca horneado en el precio**: `unit_price` es siempre el precio de lista, y `discount` es el monto que se descuenta de esa línea. 
+```json
+{ "sku": "BURGER-01", "quantity": 2, "unit_price": 5.00, "discount": 0.60 }
+```
+ Es **monto absoluto de la línea, no por unidad**: dos hamburguesas con 0.30 de descuento cada una se declaran como `0.60`. El descuento baja la base imponible **y** el IVA, y viaja al comprobante electrónico línea por línea. Un descuento nunca va como precio negativo: `unit_price` siempre es ≥ 0, y `discount` no puede superar el monto de la línea. ## Declarar por línea para saber qué fila falló [Sección titulada «Declarar por línea para saber qué fila falló»](#declarar-por-línea-para-saber-qué-fila-falló) Un descuadre agregado —“esperaba 10.00, recibí 9.98”— es ambiguo: puede ser ocho filas acumulando redondeo o una sola fila mal calculada, y son problemas distintos. Por eso cada línea puede declarar lo que **tú** calculaste: | campo | qué es | | ---------------- | --------------------------------------------------------------------------- | | `line_total` | el total de esa línea **con IVA**: `unit_price × quantity − discount + IVA` | | `vat_applicable` | si esa línea grava IVA | Los dos son **opcionales** y ninguno se usa para calcular: RunFood calcula el suyo y compara. Si no coinciden responde `422 line_mismatch` diciendo qué fila: 
+```plaintext
+tabs[0].items[0] (BURGER-01): line_total expected 10.81, received 11.50
+```
+ `vat_applicable` se verifica contra el catálogo del comercio, que es el que manda. La tarifa y el código tributario nunca viajan en el payload: no necesitas conocer los códigos fiscales del país. ## Lo que RunFood NO te calcula [Sección titulada «Lo que RunFood NO te calcula»](#lo-que-runfood-no-te-calcula) * **Propina y servicio.** No se envían al crear el pedido.
+
+# Webhooks
+
+> Suscribete a los eventos de RunFood, verifica la firma HMAC de cada entrega y reacciona a pedidos y facturas sin hacer polling.
+
+RunFood notifica a **tu** servidor cuando algo ocurre en el local (se crea un pedido, se cierra una factura, se anula una venta). Cuando pasa, RunFood hace un `POST` HTTP con el evento al endpoint que registraste. Así no necesitas hacer *polling*. ## Registrar tus suscripciones [Sección titulada «Registrar tus suscripciones»](#registrar-tus-suscripciones) | Método | Ruta | Scope | Qué hace | | -------- | ---------------- | ---------------- | ---------------------------------------------------------------- | | `POST` | `/webhooks` | `webhooks:write` | Te suscribes a un evento. Devuelve un `secret` **una sola vez**. | | `GET` | `/webhooks` | `webhooks:read` | Lista tus suscripciones (sin el secret). | | `DELETE` | `/webhooks/{id}` | `webhooks:write` | Cancela una suscripción. | `webhooks:write` ya incluye `webhooks:read` — con pedir el primero te basta. **Tus suscripciones son privadas.** Ninguna otra app puede verlas, modificarlas ni borrarlas, ni tú las suyas. **Request** de `POST /webhooks`: 
+```json
+{ "event": "ORDER.CREATED", "endpoint": "https://tu-servidor.com/webhooks/runfood" }
+```
+ El `endpoint` debe ser una URL `http` o `https`. Cualquier otro esquema se rechaza con `400 validation_error`. **Respuesta** `201`: 
+```json
+{
+  "id": 15,
+  "eventName": "ORDER.CREATED",
+  "endpoint": "https://tu-servidor.com/webhooks/runfood",
+  "secret": "rfwhk_9f3a...e21c"
+}
+```
+ Guarda el `secret` al registrarte RunFood **genera** el `secret` — tú no lo eliges. Se muestra **una sola vez**, en esta respuesta, y es lo que te permite verificar la firma (ver abajo). No se puede recuperar después: `GET /webhooks` no lo devuelve. Si lo pierdes, borra la suscripción y créala de nuevo. ## Qué recibe tu servidor [Sección titulada «Qué recibe tu servidor»](#qué-recibe-tu-servidor) Cada webhook es un `POST` con este cuerpo: 
+```json
+{
+  "event": "ORDER.CREATED",
+  "timestamp": "2026-07-01T14:03:22.114Z",
+  "schema_version": "2025-02-12",
+  "data": { "...": "depende del evento, ver abajo" },
+  "metadata": {
+    "usuario":     { "id": 4, "nombre": "CAJA 1" },
+    "dispositivo": { "id": "tablet-abc", "nombre": "Caja Principal" }
+  }
+}
+```
+ Headers de la petición: | Header | Valor | | ----------------- | ------------------------------------------------------------------ | | `Content-Type` | `application/json` | | `X-Event-Type` | nombre del evento (ej. `ORDER.CREATED`) | | `X-Request-ID` | id único del envío — úsalo para deduplicar | | `X-Signature-256` | firma HMAC (ver abajo) — presente si tu suscripción tiene `secret` | ## Verificar la firma (HMAC-SHA256) [Sección titulada «Verificar la firma (HMAC-SHA256)»](#verificar-la-firma-hmac-sha256) Antes de procesar un webhook, verifica que vino de RunFood. La firma llega en `X-Signature-256` con el formato de GitHub: `sha256=HMAC_SHA256(secret, cuerpo_crudo)`. Calcula lo mismo con tu `secret` sobre el **cuerpo crudo** (sin re-serializar) y compara: 
+```js
+import { createHmac, timingSafeEqual } from "crypto";
+
+
+function esValido(cuerpoCrudo, headerFirma, secret) {
+  const esperado = "sha256=" + createHmac("sha256", secret).update(cuerpoCrudo).digest("hex");
+  const a = Buffer.from(esperado), b = Buffer.from(headerFirma || "");
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+```
+ Si no coinciden, **descarta** el mensaje. (Suscripciones antiguas creadas sin `secret` llegan sin `X-Signature-256`; vuelve a registrarlas para obtener uno.) ## Eventos disponibles y su `data` [Sección titulada «Eventos disponibles y su data»](#eventos-disponibles-y-su-data) | Evento | Cuándo se dispara | `data` | | ------------------------ | ------------------------------------------- | ----------------------------------------------- | | `ORDER.CREATED` | Se crea un pedido nuevo | Pedido | | `ORDER.UPDATED` | Se modifica un pedido existente | Pedido | | `ORDER.SAVED` | Siempre que se crea o modifica un pedido | Pedido | | `ORDER.CLOSED` | El pedido queda facturado (cerrado) | Pedido | | `ORDER.REVERSED` | Se anula un pedido | Pedido + `usuarioAnulacion`, `motivoAnulacion` | | `ORDER.PRODUCT.REVERSED` | Se anulan ítems de un pedido | Pedido + `eliminados[]` | | `INVOICE.CREATED` | Se emite una factura/venta (una por cuenta) | Factura | | `INVOICE.UPDATED` | Se modifica una factura | Factura | | `INVOICE.REVERSED` | Se anula una factura | Factura + `usuarioAnulacion`, `motivoAnulacion` | | `DAY_CLOSED.REVERSED` | Se revierte un cierre de caja | objeto de cierre | | `TAREA_ENTIDAD.CERRADO` | Se completa una tarea | objeto de tarea | | `ANEXO_ENTIDAD.CREADO` | Se adjunta un anexo | objeto de anexo | > Para integraciones de pedidos normalmente te interesan `ORDER.*` e `INVOICE.*`. Suscríbete solo a lo que vayas a procesar. ### `data` de un Pedido (eventos `ORDER.*`) [Sección titulada «data de un Pedido (eventos ORDER.\*)»](#data-de-un-pedido-eventos-order) | Campo | Tipo | Descripción | | --------------------------------------------------- | ---------------- | ----------------------------------------------------------------- | | `id` | number | Id del pedido en RunFood | | `numero` | string \| number | Número visible del pedido | | `estado` | string | `P` = pendiente/abierto · `A` = facturado/cerrado · `I` = anulado | | `total` | number | Total del pedido | | `iva` `baseIva` `base0` `descuentoTotal` `servicio` | number | Desglose de totales | | `mesa` | number \| string | Mesa / cuenta | | `pax` | number | Nº de comensales | | `detalle` | array | Ítems del pedido (ver abajo) | | `pagos` | array | Pagos aplicados (si está facturado) | | `ventas` | array | Facturas generadas (si se cerró) — ver “Factura” | | `external_id` | string | El id que tú enviaste (idempotencia) | | `external_app` | string | Id de tu app (o `null` si el pedido lo hizo el POS) | | `timestamp` `fechaCreacion` `createdAt` | string | Marcas de tiempo | | `eliminados` | array | Ítems anulados — **solo** en `ORDER.PRODUCT.REVERSED` | | `usuarioAnulacion` `motivoAnulacion` | objeto / string | **solo** en `ORDER.REVERSED` | **Ítem del `detalle[]`:** `descripcion` (string), `cantidad` (number), `pvp` (number), `descuento` (number), `pagaIva` (boolean), `observacion` (string), y un id de línea `idDetalle` (number). ### `data` de una Factura (eventos `INVOICE.*`, y dentro de `ventas[]`) [Sección titulada «data de una Factura (eventos INVOICE.\*, y dentro de ventas\[\])»](#data-de-una-factura-eventos-invoice-y-dentro-de-ventas) | Campo | Tipo | Descripción | | ----------------------------------------------------- | ---------------- | ---------------------------------------------------------------- | | `id` | string \| number | Id de la factura | | `documento` | number | `1` = factura · `3` = nota de entrega | | `numero` | number | Número del comprobante | | `serie1` `serie2` | string | Serie (establecimiento-punto de emisión) | | `esElectronica` | boolean | Si es comprobante electrónico (SRI) | | `cliente` | objeto | `{ identificacion, razonSocial, telefono?, direccion?, email? }` | | `detalle` | array | Ítems facturados | | `pagos` | array | Pagos aplicados | | `total` `iva` `baseIva` `base0` `descuento` `propina` | number | Totales | | `idPedido` `numeroPedido` | string \| number | Pedido de origen | | `fechaCreacion` `fechaAutorizacion` `fechaAnulacion` | string | Marcas de tiempo | | `tarjetaPuntos` | string | Tarjeta de puntos / fidelización (si aplica) | | `usuarioAnulacion` `motivoAnulacion` | objeto / string | **solo** en `INVOICE.REVERSED` | **Ítem del `detalle[]`:** `descripcion` (string), `cantidad` (number), `pvp` (number), `neto` (number), `descuento` (number), `iva` (number), `pagaIva` (boolean), y `producto` `{ codigo, nombre }`. ## Entrega: las reglas del juego [Sección titulada «Entrega: las reglas del juego»](#entrega-las-reglas-del-juego) | Regla | Qué significa para ti | | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | | **No hay reintentos** | RunFood lo intenta **una vez**. Si tu servidor está caído o responde con error, **ese evento se perdió para siempre**. | | **Tienes 10 segundos** | Es el tiempo que RunFood espera tu respuesta antes de darla por fallida. Responde `2xx` **de inmediato** y haz el trabajo pesado en segundo plano. | | **Sin orden garantizado** | Los eventos pueden llegarte desordenados. Ordena por `timestamp`, no por orden de llegada. | | **Responde `2xx`** | Cualquier `2xx` sirve (`200`, `202`, `204`). Un `3xx`, `4xx` o `5xx` cuenta como fallo — y no se reintenta. | Los webhooks NO son suficientes. Nunca. Como no hay reintentos, un webhook perdido **no avisa de que se perdió**. Si construyes tu integración solo sobre webhooks, vas a tener huecos en tus datos y no vas a enterarte. **Necesitas reconciliar.** Periódicamente, pregunta por lo que pasó: 
+```bash
+GET /invoices?from=2026-07-01&until=2026-07-11&page=1&limit=100
+```
+ Compara con lo que tienes y baja lo que falte. Una vez al día basta. Hoy solo puedes reconciliar FACTURAS `GET /invoices` acepta rango de fechas y paginación, así que puedes recuperar las facturas perdidas. **Pero no existe un listado de pedidos.** Solo `GET /orders/{id}`, que necesita el id — que es justamente lo que perdiste al perder el webhook. Si tu integración depende de pedidos **abiertos** (no facturados), hoy no tienes forma de reconciliarlos. Si ese es tu caso, escríbenos antes de diseñar tu arquitectura sobre esta limitación.

@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://runfoodapp.github.io/api-docs/sitemap-index.xml
